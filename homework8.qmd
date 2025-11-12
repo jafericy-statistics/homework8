@@ -1,0 +1,311 @@
+---
+title: "Homework 8"
+author: "Jacob A. Fericy"
+format: html
+editor: visual
+---
+
+## Introduction
+
+The goal of this data report is to perform exploratory data analysis (EDA), clean and transform the data, summarize it at a daily level, and then fit multiple linear regression (MLR) models with various complexities that simulate industry modeling.
+
+Before we begin, lets import the required packages.
+
+```{r}
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(readr)
+  library(httr)
+  library(lubridate)
+  library(dplyr)
+  library(janitor)
+  library(stringi)
+})
+set.seed(42)
+```
+
+We begin by loading the Seoul Bike Sharing dataset directly from the NC State Statistics repository. We then want to ensure proper encoding to handle special characters (that typically come during data transfers and cloud sessions) andwhile also preventing data corruption. Column names are cleaned for consistency, and the Date variable is converted into a true date format using the lubricate function.
+
+Finally, categorical variables such as Seasons, Holiday, and Functioning Day are converted into factors, preparing the data for analysis and modeling, and also demonstrating a transformation that could commonly occurs.
+
+## Analysis
+
+```{r}
+
+read_csv_utf8_normalized <- function(url) {
+  #get resp and raw bytes from source
+  resp <- httr::GET(url)
+  stop_for_status(resp)
+  raw <- httr::content(resp, as = "raw")
+  
+  #take a guess on the encoding, using latin or utf-8 but it can be different
+  enc_guess <- tryCatch(
+    readr::guess_encoding(raw)$encoding[1],
+    error = function(e) NULL
+  )
+  if (is.na(enc_guess) || is.null(enc_guess)) enc_guess <- "UTF-8"
+  
+  #parse bytes and data using guessed encoding to see if we can read in
+  df <- readr::read_csv(I(raw), locale = readr::locale(encoding = enc_guess), show_col_types = FALSE)
+  
+  #let's normalize char cols to UTF-8 ignoring the additional bytes
+  df <- df %>%
+    mutate(across(where(is.character), ~ stringi::stri_enc_toutf8(., is_unknown_8bit = TRUE)))
+  df
+}
+
+data_url <- "https://www4.stat.ncsu.edu/~online/datasets/SeoulBikeData.csv"
+bikes_raw <- read_csv_utf8_normalized(data_url)
+```
+
+Next, we want to clean column names and ensure correct data types so we can use the data downstream with the model. This is one of the more important processes for modeling, as an incorrect column name or data type can complete render the model code useless, until the data is adjusted.
+
+```{r}
+#normalize text encoding across char cols to convert to utf8 encoding
+bikes_raw <- bikes_raw %>%
+  dplyr::mutate(across(where(is.character),
+                       ~ iconv(., from = "", to = "UTF-8", sub = "")))
+```
+
+Now we want to check for missing values and ensure that columns contain the expected data types that we want.
+
+```{r}
+#need to call data set and clean prior as well, to ensure out summarizations work
+bikes <- bikes_raw %>%
+  janitor::clean_names() %>%
+  mutate(
+    date = lubridate::dmy(date),
+    seasons = as.factor(seasons),
+    holiday = as.factor(holiday),
+    functioning_day = as.factor(functioning_day)
+  )
+
+bikes %>%
+summarize(across(everything(), ~ sum(is.na(.)))) %>%
+pivot_longer(everything(), names_to = "column", values_to = "n_missing") %>%
+arrange(desc(n_missing))
+```
+
+We then need to filter out rows where bikes were not functioning (non-operational days).
+
+```{r}
+bikes_fun <- bikes %>%
+filter(functioning_day == "Yes")
+
+if (nrow(bikes_fun) == 0) {
+bikes_fun <- bikes
+}
+```
+
+To simplify the analysis, we want summarize the data to a daily level by season and holiday to reduce complexity and see if there are seasonal or holiday effects.
+
+\
+We sum bike counts and precipitation variables, and average weather conditions.
+
+```{r}
+num_cols <- bikes_fun %>% select(where(is.numeric)) %>% names()
+sum_cols <- intersect(c("rented_bike_count", "rainfall_mm", "snowfall_cm"), num_cols)
+avg_cols <- setdiff(num_cols, c(sum_cols, "hour"))
+
+bikes_daily <- bikes_fun %>%
+group_by(date, seasons, holiday) %>%
+summarize(
+across(all_of(sum_cols), ~ sum(.x, na.rm = TRUE)),
+across(all_of(avg_cols), ~ mean(.x, na.rm = TRUE)),
+.groups = "drop"
+) %>%
+clean_names()
+```
+
+We calculate summary statistics across all numeric columns and categorical groups.
+
+```{r}
+bikes_daily %>%
+summarize(across(where(is.numeric), list(mean = mean, sd = sd, min = min, max = max), na.rm = TRUE))
+```
+
+We can also compare daily rentals across seasons and holidays:
+
+```{r}
+bikes_daily %>%
+group_by(seasons, holiday) %>%
+summarize(
+days = n(),
+avg_bikes = mean(rented_bike_count, na.rm = TRUE),
+sd_bikes = sd(rented_bike_count, na.rm = TRUE),
+.groups = "drop"
+)
+```
+
+We then want to visualize key patterns across seasons and temperature.
+
+```{r}
+#return a boxplot of rentals by season
+ggplot(bikes_daily, aes(seasons, rented_bike_count)) +
+geom_boxplot(fill = "orange") +
+labs(title = "Daily Bike Rentals (Season)", x = "season", y = "rented bike count")
+
+#scatter and trend on rentals v. temp
+ggplot(bikes_daily, aes(temperature_c, rented_bike_count)) +
+geom_point(alpha = 0.5) +
+geom_smooth(method = "lm", se = FALSE) +
+labs(title = "Daily Rentals vs Temperature", x = "temperature (°C)", y = "rented bike count")
+```
+
+We create a weekday/weekend factor from the `date` variable.
+
+```{r}
+feat_df <- bikes_daily %>%
+mutate(
+wday = wday(date, label = TRUE),
+day_type = factor(if_else(wday %in% c("Sat", "Sun"), "weekend", "weekday"))
+) %>%
+select(-wday)
+```
+
+## Splitting Data
+
+We perform a 75/25 train-test split, stratified by the seasons.
+
+```{r}
+strat_split <- function(df, prop = 0.75, strata_col = "seasons") {
+df <- df %>% mutate(.rowid = row_number())
+idx_train <- df %>%
+group_by(.data[[strata_col]]) %>%
+group_map(~ sample(.x$.rowid, size = ceiling(nrow(.x) * prop))) %>%
+unlist()
+list(
+train = df %>% filter(.rowid %in% idx_train) %>% select(-.rowid),
+test = df %>% filter(!(.rowid %in% idx_train)) %>% select(-.rowid)
+)
+}
+
+spl <- strat_split(feat_df, prop = 0.75, strata_col = "seasons")
+train_df <- spl$train
+test_df <- spl$test
+```
+
+## Model Building and Examples
+
+We define formulas for three regressions:
+
+-    **Model 1**: Base additive effects
+
+-   **Model 2**: Adds interactions
+
+-   **Model 3**: Adds quadratic terms
+
+```{r}
+base_predictors <- c(
+  "seasons", "holiday", "day_type",
+  "temperature_c", "humidity", "windspeed_ms", "visibility_10m",
+  "dew_point_temperature_c", "solar_radiation_mj_m2",
+  "rainfall_mm", "snowfall_cm"
+)
+
+present_preds <- intersect(base_predictors, names(train_df))
+
+#first form additive effects
+stopifnot("rented_bike_count" %in% names(train_df))
+form1 <- as.formula(paste(
+  "rented_bike_count ~",
+  if (length(present_preds)) paste(present_preds, collapse = " + ") else "1"
+))
+
+#second form interactions
+int_terms <- character(0)
+if (all(c("seasons", "holiday") %in% names(train_df))) {
+  int_terms <- c(int_terms, "seasons:holiday")
+}
+if (all(c("seasons", "temperature_c") %in% names(train_df))) {
+  int_terms <- c(int_terms, "seasons:temperature_c")
+}
+if (all(c("temperature_c", "rainfall_mm") %in% names(train_df))) {
+  int_terms <- c(int_terms, "temperature_c:rainfall_mm")
+}
+
+form2 <- as.formula(paste(
+  "rented_bike_count ~",
+  paste(c(present_preds, int_terms), collapse = " + ")
+))
+
+#third form quadratic
+num_candidates <- c(
+  "temperature_c","humidity","windspeed_ms","visibility_10m",
+  "dew_point_temperature_c","solar_radiation_mj_m2","rainfall_mm","snowfall_cm"
+)
+num_present <- intersect(num_candidates, names(train_df))
+quad_terms <- if (length(num_present)) paste0("I(", num_present, "^2)") else character(0)
+
+form3 <- as.formula(paste(
+  "rented_bike_count ~",
+  paste(c(present_preds, int_terms, quad_terms), collapse = " + ")
+))
+```
+
+## Cross-Validation
+
+We then want to perform a manual 10-fold CV on the training data.
+
+```{r}
+#define rmse function
+rmse <- function(actual, pred) sqrt(mean((actual - pred)^2, na.rm = TRUE))
+
+#create folds
+make_folds <- function(n, k = 10) split(sample.int(n), cut(seq_along(sample.int(n)), k, labels = FALSE))
+
+#corss validation evaluator
+cv_eval <- function(df, form, k = 10) {
+  folds <- make_folds(nrow(df), k)
+  mean(sapply(folds, function(idx) {
+    d_train <- df[-idx, ] %>% dplyr::select(-dplyr::any_of("date"))
+    d_valid <- df[ idx, ] %>% dplyr::select(-dplyr::any_of("date"))
+    fit <- lm(form, data = d_train)
+    pred <- predict(fit, newdata = d_valid)
+    rmse(d_valid$rented_bike_count, pred)
+  }))
+}
+
+#define cross validations
+cv1 <- cv_eval(train_df, form1)
+cv2 <- cv_eval(train_df, form2)
+cv3 <- cv_eval(train_df, form3)
+
+data.frame(
+Model = c("Base", "Interactions", "Quadratic"),
+CV_RMSE = c(cv1, cv2, cv3)
+)
+```
+
+## Final Model Evaluation
+
+We then want to select the best model based on CV RMSE, fit it to the full training data, and evaluate on the test set.
+
+```{r}
+best_form <- list(form1, form2, form3)[[which.min(c(cv1, cv2, cv3))]]
+
+final_fit <- lm(best_form, data = train_df)
+test_pred <- predict(final_fit, newdata = test_df)
+test_rmse <- rmse(test_df$rented_bike_count, test_pred)
+test_rmse
+```
+
+## Model Coefficients
+
+Finally, we inspect the most influential coefficients by their t-values.
+
+```{r}
+#grab coeff table from final model
+coef_df <- summary(final_fit)$coefficients %>%
+  as.data.frame() %>%
+  rownames_to_column("term") %>%
+  #sort by abs value on t
+  arrange(desc(abs(`t value`)))
+
+#print head example
+head(coef_df, 20)
+```
+
+## Conclusion
+
+In conclusion, we were able to identify missing data and confirm data types while also aggregating to confirm to daily data summaries. We also were able to build and compare three separate but similar regression models with cross-validation. We found the best model, with the lowest RMSE given that is the most effective method in this case to identify best mode. We also were able to explore non-linear models in this case and understand more about data science.
